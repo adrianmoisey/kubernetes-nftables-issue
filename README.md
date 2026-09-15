@@ -7,6 +7,7 @@
   - [ClusterIP -> endpoint - current](#clusterip---endpoint---current)
 - [Proposed design: shared dispatch chains + one endpoints map](#proposed-design-shared-dispatch-chains--one-endpoints-map)
   - [ClusterIP -> endpoint - suggested](#clusterip---endpoint---suggested)
+  - [Tradeoffs](#tradeoffs)
 
 ## The problem
 
@@ -280,3 +281,93 @@ The `dispatch-N` chains are not per Service: svc-B and svc-D both have two
 endpoints, so both `goto dispatch-2` and are told apart only by their rows in
 `@endpoints`. Only as many chains exist as there are distinct endpoint counts
 in the cluster.
+
+### Tradeoffs
+
+Naturally, a change like this doesn't come for free.
+
+Some tradeoffs:
+
+**Increased number nft commands per kube-proxy update**
+
+In the past each Service would update it's anonymous map in a single command, ie:
+
+```
+add rule ip kube-proxy service-4AT6LBPK-ns3/svc3/tcp/p80 meta l4proto tcp dnat ip addr . port to numgen random mod 2 map { 0 : 10.0.3.2 . 80 , 1 : 10.0.3.3 . 80 }
+```
+
+Changes to endpoints now require managing endpoints in that map, adding/removing them as nessesary. Additionally, `numgen random mod N` requires that the endpoint IPs value `ct mark` is sequential.
+
+Example of adding the 40th endpoint to a 39 endpoint service:
+
+```nftables
+# Add 40 endpoint dispatch chain
+add chain ip kube-proxy dispatch-40
+flush chain ip kube-proxy dispatch-40
+add rule ip kube-proxy dispatch-40 ct mark set numgen random mod 40 dnat ip addr . port to ip daddr . meta l4proto . th dport . ct mark map @endpoints
+
+# Update Service IP pointing it at the correct dispatch chain
+delete element ip kube-proxy service-ips { 10.96.173.12 . tcp . 80 }
+add element ip kube-proxy service-ips { 10.96.173.12 . tcp . 80 : goto dispatch-40 }
+
+# Append the 40th endpoint to the shared endpoint map
+add element ip kube-proxy endpoints { 10.96.173.12 . tcp . 80 . 39 : 10.244.0.46 . 80 }
+
+# Remove the now unused 39th endpoint chain
+flush chain ip kube-proxy dispatch-39
+```
+
+Example of removing the 40th endpoint from a 40 endpoint map:
+
+```nftables
+# Add 39 endpoint dispatch chain
+add chain ip kube-proxy dispatch-39
+flush chain ip kube-proxy dispatch-39
+add rule ip kube-proxy dispatch-39 ct mark set numgen random mod 39 dnat ip addr . port to ip daddr . meta l4proto . th dport . ct mark map @endpoints
+
+# Update Service IP pointing it at the correct dispatch chain
+delete element ip kube-proxy service-ips { 10.96.173.12 . tcp . 80 }
+add element ip kube-proxy service-ips { 10.96.173.12 . tcp . 80 : goto dispatch-39 }
+
+# Remove the now unused 40th endpoint chain
+flush chain ip kube-proxy dispatch-40
+
+# Remove the 39th endpoint from the map
+delete element ip kube-proxy endpoints { 10.96.173.12 . tcp . 80 . 39 }
+```
+
+
+FIXME: <insert example of removing the nth endpoint from an n+n map>
+
+
+#### Potential optimisations
+
+1. Pre-create the dispatch chains
+
+2. Combine these delete/adds to an update:
+
+```nftables
+delete element ip kube-proxy service-ips { 10.96.173.12 . tcp . 80 }
+add element ip kube-proxy service-ips { 10.96.173.12 . tcp . 80 : goto dispatch-39 }
+```
+
+```nftables
+replace element ip kube-proxy service-ips { 10.96.173.12 . tcp . 80 : goto dispatch-39 }
+```
+
+## Alternative solutions
+
+1. Patch the kernel
+
+Kubernetes minimum kernel version is very old, so will need to wait long for older distros to get the patched kernel.
+I plan to do this anyway for future us.
+
+1. Change to the iptables style of lookups:
+
+```nftables
+add rule ip t svc-web 'numgen random mod 3 == 0 dnat to 10.244.1.5:8080'
+add rule ip t svc-web 'numgen random mod 2 == 0 dnat to 10.244.2.7:8080'
+add rule ip t svc-web 'dnat to 10.244.3.6:8080'
+```
+
+This isn't really an option, since we'll be doing O(n) lookups for routing. The promise of nftables was that we can do O(1) lookups, see https://kubernetes.io/blog/2025/02/28/nftables-kube-proxy/
