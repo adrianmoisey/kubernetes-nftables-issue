@@ -344,7 +344,7 @@ FIXME: <insert example of removing the nth endpoint from an n+n map>
 
 #### Potential optimisations
 
-1. Pre-create the dispatch chains
+1. Maintain a pre-created number of the dispatch chains (how many?)
 
 2. Combine these delete/adds to an update:
 
