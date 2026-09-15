@@ -8,6 +8,8 @@
 - [Proposed design: shared dispatch chains + one endpoints map](#proposed-design-shared-dispatch-chains--one-endpoints-map)
   - [ClusterIP -> endpoint - suggested](#clusterip---endpoint---suggested)
   - [Tradeoffs](#tradeoffs)
+    - [Potential optimisations](#potential-optimisations)
+- [Alternative solutions](#alternative-solutions)
 
 ## The problem
 
