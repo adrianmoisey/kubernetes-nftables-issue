@@ -338,8 +338,30 @@ flush chain ip kube-proxy dispatch-40
 delete element ip kube-proxy endpoints { 10.96.173.12 . tcp . 80 . 39 }
 ```
 
+Reducing from 40 to 39 endpoints:
 
-FIXME: <insert example of removing the nth endpoint from an n+n map>
+```nftables
+# Add 39 endpoint dispatch chain
+add chain ip kube-proxy dispatch-39
+flush chain ip kube-proxy dispatch-39
+add rule ip kube-proxy dispatch-39 ct mark set numgen random mod 39 dnat ip addr . port to ip daddr . meta l4proto . th dport . ct mark map @endpoints
+
+# Update Service IP pointing it at the correct dispatch chain
+delete element ip kube-proxy service-ips { 10.96.113.194 . tcp . 80 }
+add element ip kube-proxy service-ips { 10.96.113.194 . tcp . 80 : goto dispatch-39 }
+
+# Remove the endpoint that went away (in slot 33)
+delete element ip kube-proxy endpoints { 10.96.113.194 . tcp . 80 . 33 }
+
+# Add the very last endpoint into slot 33
+add element ip kube-proxy endpoints { 10.96.113.194 . tcp . 80 . 33 : 10.244.0.41 . 80 }   <-----+
+                                                                                                 |
+# Delete now unused dispatch-40                                                                  |
+flush chain ip kube-proxy dispatch-40                                                            |
+                                                                                                 |     endpoint moved from 39 (last) to 33
+# Remove the very last endpoint that is now in slot 33                                           |
+delete element ip kube-proxy endpoints { 10.96.113.194 . tcp . 80 . 39 }         ----------------+
+```
 
 
 #### Potential optimisations
