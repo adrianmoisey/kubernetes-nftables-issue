@@ -10,6 +10,8 @@
   - [Tradeoffs](#tradeoffs)
     - [Potential optimisations](#potential-optimisations)
 - [Alternative solutions](#alternative-solutions)
+- [Additional](#additional)
+  - [Memory usage](#memory-usage)
 
 ## The problem
 
@@ -386,6 +388,8 @@ replace element ip kube-proxy service-ips { 10.96.173.12 . tcp . 80 : goto dispa
 Kubernetes minimum kernel version is very old, so will need to wait long for older distros to get the patched kernel.
 I plan to do this anyway for future us.
 
+We could just patch the kernel, and any user that has an issue can be told to go upgrade themselves
+
 1. Change to the iptables style of lookups:
 
 ```nftables
@@ -395,3 +399,48 @@ add rule ip t svc-web 'dnat to 10.244.3.6:8080'
 ```
 
 This isn't really an option, since we'll be doing O(n) lookups for routing. The promise of nftables was that we can do O(1) lookups, see https://kubernetes.io/blog/2025/02/28/nftables-kube-proxy/
+
+## Additional
+
+### Memory usage
+
+[This article](https://shvbsle.in/hyperscalers-are-hard/) got me wondering if the new 'single-map" change would change the memory usage of nft and/or nftbales.
+
+I'm not 100% sure on the correct way to test this, but, AI helped me create this.
+
+Files are included in this repo for comparison.
+
+The ruleset is 45k services, each with a single endpoint.
+
+```console
+root@colima:/Users/adrian/src/adrianmoisey/kubernetes-nftables-issue# bench nft-new /Users/adrian/src/adrianmoisey/kubernetes-nftables-issue/kube-proxy-nft-45k-single-map.ruleset
+214644 KiB max RSS, 0.47 s elapsed
+nft-new: nft exit=0
+nft-new    25 chains
+== nft-new
+anon 0
+file 0
+kernel 9781248
+percpu 960
+vmalloc 0
+slab_unreclaimable 9776768
+peak 227418112
+root@colima:/Users/adrian/src/adrianmoisey/kubernetes-nftables-issue# bench nft-old /Users/adrian/src/adrianmoisey/kubernetes-nftables-issue/kube-proxy-nft-45k-current-kube-proxy.ruleset
+552812 KiB max RSS, 540.29 s elapsed
+nft-old: nft exit=0
+nft-old    45019 chains
+== nft-old
+anon 0
+file 0
+kernel 64827392
+percpu 0
+vmalloc 0
+slab_unreclaimable 64826640
+peak 629293056
+root@colima:/Users/adrian/src/adrianmoisey/kubernetes-nftables-issue# summary nft-old nft-new
+test             kernel         peak    transient
+nft-old        61.8 MiB    600.1 MiB    538.3 MiB
+nft-new         9.3 MiB    216.9 MiB    207.6 MiB
+```
+
+It seems that the new map is an improvement on memory usage
