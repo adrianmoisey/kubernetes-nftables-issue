@@ -5,11 +5,13 @@
 - [Solution](#solution)
 - [How kube-proxy currently works](#how-kube-proxy-currently-works)
   - [ClusterIP -> endpoint - current](#clusterip---endpoint---current)
-- [Proposed designs: shared dispatch chains + one endpoints map](#proposed-designs-shared-dispatch-chains--one-endpoints-map)
+- [Proposed designs: shared dispatch chains + shared endpoints maps](#proposed-designs-shared-dispatch-chains--shared-endpoints-maps)
   - [Design 1: bucket from numgen directly](#design-1-bucket-from-numgen-directly)
     - [Why it won't work](#why-it-wont-work)
   - [Design 2: bucket via ct mark](#design-2-bucket-via-ct-mark)
     - [Why it won't work](#why-it-wont-work-1)
+  - [Design 3: one endpoints map per protocol](#design-3-one-endpoints-map-per-protocol)
+    - [Downsides](#downsides)
   - [Tradeoffs](#tradeoffs)
     - [Potential optimisations](#potential-optimisations)
 - [Alternative solutions](#alternative-solutions)
@@ -205,15 +207,16 @@ so the number of chains and maps grows one-for-one with the number of Services.
 Note that svc-B and svc-D have identical rules apart from the endpoint IPs, yet
 each still gets its own chain and map.
 
-## Proposed designs: shared dispatch chains + one endpoints map
+## Proposed designs: shared dispatch chains + shared endpoints maps
 
-Instead of a chain and an anonymous map per Service, both designs keep a
+Instead of a chain and an anonymous map per Service, all designs keep a
 fixed set of `dispatch-N` chains (one per *endpoint count*, shared by every
-Service with that many endpoints) and a single shared `@endpoints` map that is
-keyed by the Service plus a random bucket number. They differ only in how the
-bucket number gets into the map key.
+Service with that many endpoints) and a shared `@endpoints` map that is
+keyed by the Service plus a random bucket number. Designs 1 and 2 differ only
+in how the bucket number gets into the map key; Design 3 splits the map per
+protocol.
 
-Both examples use the same four Services:
+All examples use the same four Services:
 
 - svc-A - 1 endpoint
 - svc-B - 2 endpoints
@@ -270,7 +273,8 @@ are distinct endpoint counts in the cluster.
       +--------------------------------------------------------------------------------+
       |  map: @endpoints                                              (ONE shared map) |
       |                                                                                |
-      |   typeof ip daddr . meta l4proto . th dport . meta length : ip daddr . th dport|
+      |   typeof ip daddr . meta l4proto . th dport . numgen random mod 2              |
+      |          : ip daddr . th dport                                                 |
       |                                                                                |
       |   172.30.0.41 . tcp . 80 . 0 -> 10.0.1.1:80    # svc-A                         |
       |                                                                                |
@@ -290,9 +294,10 @@ are distinct endpoint counts in the cluster.
                                          endpoint pod
 ```
 
-`numgen` has no named datatype, so the map must be declared with `typeof`;
-`th dport` and `meta length` are only there to lend their datatypes
-(`inet_service`, 32-bit integer) to the key.
+`numgen` has no named datatype, so the map must be declared with `typeof`. The
+expressions there only lend their datatypes to the key: `th dport` gives
+`inet_service`, `numgen random mod 2` a 32-bit integer (the `2` is meaningless;
+rules can use any modulus).
 
 #### Why it won't work
 
@@ -392,6 +397,114 @@ masked either, since merging `numgen` into part of the mark needs a
 two-register bitwise OR (kernel 6.13+ / nft 1.1.2+). `meta mark` has the same
 problem and additionally erases kube-proxy's own `0x4000` masquerade bit, which
 `services` sets before dispatching.
+
+### Design 3: one endpoints map per protocol
+
+Same as Design 1, but with one `typeof` map per transport protocol
+(`@endpoints-tcp`, `@endpoints-udp`, `@endpoints-sctp`) and one rule per
+protocol in each `dispatch-N` chain. The protocol moves out of the key and
+into the map name, so the key can use `tcp dport` / `udp dport` / `sctp dport`
+instead of `th dport`.
+
+```
+    packet to  <clusterIP>:<port>
+                |
+                v
+      +-------------------+
+      |  chain: services  |
+      +-------------------+
+                |
+                |  lookup  dst . proto . port
+                v
+      +------------------------------------------+
+      |  map: @service-ips      (ONE shared map) |
+      |                                          |
+      |   type ipv4_addr . inet_proto            |
+      |        . inet_service : verdict          |
+      |                                          |
+      |   172.30.0.41 . tcp . 80  -> dispatch-1  |   # svc-A
+      |   172.30.0.42 . tcp . 80  -> dispatch-2  |   # svc-B
+      |   172.30.0.43 . tcp . 80  -> dispatch-3  |   # svc-C
+      |   172.30.0.44 . tcp . 80  -> dispatch-2  |   # svc-D - shared with svc-B, which also has 2 endpoints
+      |   ...        one row per Service, value  |
+      |              is just "how many endpoints"|
+      +------------------------------------------+
+                            |
+                 +----------+------------------------+-----------------------------------+
+                 |                                   |                                   |
+                 | goto                              | goto                              | goto
+                 | (svc-A)                           | (svc-B, svc-D)                    | (svc-C)
+                 v                                   v                                   v
++--------------------------------+  +--------------------------------+  +--------------------------------+
+| chain: dispatch-1              |  | chain: dispatch-2              |  | chain: dispatch-3              |
+|                                |  |                                |  |                                |
+| dnat to dst . tcp dport        |  | dnat to dst . tcp dport        |  | dnat to dst . tcp dport        |
+|         . numgen random mod 1  |  |         . numgen random mod 2  |  |         . numgen random mod 3  |
+|         map @endpoints-tcp     |  |         map @endpoints-tcp     |  |         map @endpoints-tcp     |
+|                                |  |                                |  |                                |
+| dnat to dst . udp dport        |  | dnat to dst . udp dport        |  | dnat to dst . udp dport        |
+|         . numgen random mod 1  |  |         . numgen random mod 2  |  |         . numgen random mod 3  |
+|         map @endpoints-udp     |  |         map @endpoints-udp     |  |         map @endpoints-udp     |
+|                                |  |                                |  |                                |
+| dnat to dst . sctp dport       |  | dnat to dst . sctp dport       |  | dnat to dst . sctp dport       |
+|         . numgen random mod 1  |  |         . numgen random mod 2  |  |         . numgen random mod 3  |
+|         map @endpoints-sctp    |  |         map @endpoints-sctp    |  |         map @endpoints-sctp    |
++--------------------------------+  +--------------------------------+  +--------------------------------+
+                 |                                   |                                   |
+                 +-----------------------------+-----+-----------------------------------+
+                                               |
+                                               |  lookup  dst . port . bucket  (in the map for the packet's protocol)
+                                               v
+      +--------------------------------------------------------------------------------+
+      |  map: @endpoints-tcp                                    (ONE map per protocol) |
+      |                                                                                |
+      |   typeof ip daddr . tcp dport . numgen random mod 2 : ip daddr . tcp dport     |
+      |                                                                                |
+      |   172.30.0.41 . 80 . 0 -> 10.0.1.1:80    # svc-A                               |
+      |                                                                                |
+      |   172.30.0.42 . 80 . 0 -> 10.0.2.1:80    # svc-B                               |
+      |   172.30.0.42 . 80 . 1 -> 10.0.2.2:80                                          |
+      |                                                                                |
+      |   172.30.0.43 . 80 . 0 -> 10.0.3.1:80    # svc-C                               |
+      |   172.30.0.43 . 80 . 1 -> 10.0.3.2:80                                          |
+      |   172.30.0.43 . 80 . 2 -> 10.0.3.3:80                                          |
+      |                                                                                |
+      |   172.30.0.44 . 80 . 0 -> 10.0.4.1:80    # svc-D                               |
+      |   172.30.0.44 . 80 . 1 -> 10.0.4.2:80                                          |
+      |   ...        one row per endpoint                                              |
+      +--------------------------------------------------------------------------------+
+      +--------------------------------------------------------------------------------+
+      |  map: @endpoints-udp                                                           |
+      |                                                                                |
+      |   typeof ip daddr . udp dport . numgen random mod 2 : ip daddr . udp dport     |
+      |                                                                                |
+      |   (no UDP Services in this example)                                            |
+      +--------------------------------------------------------------------------------+
+      +--------------------------------------------------------------------------------+
+      |  map: @endpoints-sctp                                                          |
+      |                                                                                |
+      |   typeof ip daddr . sctp dport . numgen random mod 2 : ip daddr . sctp dport   |
+      |                                                                                |
+      |   (no SCTP Services in this example)                                           |
+      +--------------------------------------------------------------------------------+
+                                               |
+                                               v
+                                         endpoint pod
+```
+
+`tcp dport` in the key implies a `meta l4proto tcp` match, so each rule only
+fires for its own protocol and there is no `th` expression anywhere.
+
+#### Downsides
+
+This one works: the `tcp`/`udp`/`sctp dport` expressions survive the userdata
+round-trip, so dispatch rules can be added against existing maps. The costs:
+
+- Three maps and three rules per `dispatch-N` chain instead of one; a UDP
+  packet has to fail the TCP rule before it hits the UDP one.
+- An integer-typed `typeof` key component (`numgen`) needs nft 1.0.3+
+  (kube-proxy's floor is 1.0.1).
+- Three element stores to keep in sync in kube-proxy instead of one.
 
 ### Tradeoffs
 
