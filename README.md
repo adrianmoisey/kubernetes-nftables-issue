@@ -5,13 +5,19 @@
 - [Solution](#solution)
 - [How kube-proxy currently works](#how-kube-proxy-currently-works)
   - [ClusterIP -> endpoint - current](#clusterip---endpoint---current)
-- [Proposed design: shared dispatch chains + one endpoints map](#proposed-design-shared-dispatch-chains--one-endpoints-map)
-  - [ClusterIP -> endpoint - suggested](#clusterip---endpoint---suggested)
+- [Proposed designs: shared dispatch chains + one endpoints map](#proposed-designs-shared-dispatch-chains--one-endpoints-map)
+  - [Design 1: bucket from numgen directly](#design-1-bucket-from-numgen-directly)
+    - [Why it won't work](#why-it-wont-work)
+  - [Design 2: bucket via ct mark](#design-2-bucket-via-ct-mark)
+    - [Why it won't work](#why-it-wont-work-1)
   - [Tradeoffs](#tradeoffs)
     - [Potential optimisations](#potential-optimisations)
 - [Alternative solutions](#alternative-solutions)
 - [Additional](#additional)
   - [Memory usage](#memory-usage)
+
+> [!WARNING]
+> This document is mostly some note taking for myself. I'm doing it quick and dirty with a lot of AI generated text. Sorry for the slop grenade.
 
 ## The problem
 
@@ -199,21 +205,118 @@ so the number of chains and maps grows one-for-one with the number of Services.
 Note that svc-B and svc-D have identical rules apart from the endpoint IPs, yet
 each still gets its own chain and map.
 
-## Proposed design: shared dispatch chains + one endpoints map
+## Proposed designs: shared dispatch chains + one endpoints map
 
-Instead of a chain and an anonymous map per Service, this design keeps a
+Instead of a chain and an anonymous map per Service, both designs keep a
 fixed set of `dispatch-N` chains (one per *endpoint count*, shared by every
 Service with that many endpoints) and a single shared `@endpoints` map that is
-keyed by the Service plus a random bucket number.
+keyed by the Service plus a random bucket number. They differ only in how the
+bucket number gets into the map key.
 
-### ClusterIP -> endpoint - suggested
-
-Example with four Services:
+Both examples use the same four Services:
 
 - svc-A - 1 endpoint
 - svc-B - 2 endpoints
 - svc-C - 3 endpoints
 - svc-D - 2 endpoints
+
+svc-B and svc-D both have two endpoints, so both `goto dispatch-2` and are told
+apart only by their rows in `@endpoints`. Only as many chains exist as there
+are distinct endpoint counts in the cluster.
+
+### Design 1: bucket from `numgen` directly
+
+```
+    packet to  <clusterIP>:<port>
+                |
+                v
+      +-------------------+
+      |  chain: services  |
+      +-------------------+
+                |
+                |  lookup  dst . proto . port
+                v
+      +------------------------------------------+
+      |  map: @service-ips      (ONE shared map) |
+      |                                          |
+      |   type ipv4_addr . inet_proto            |
+      |        . inet_service : verdict          |
+      |                                          |
+      |   172.30.0.41 . tcp . 80  -> dispatch-1  |   # svc-A
+      |   172.30.0.42 . tcp . 80  -> dispatch-2  |   # svc-B
+      |   172.30.0.43 . tcp . 80  -> dispatch-3  |   # svc-C
+      |   172.30.0.44 . tcp . 80  -> dispatch-2  |   # svc-D - shared with svc-B, which also has 2 endpoints
+      |   ...        one row per Service, value  |
+      |              is just "how many endpoints"|
+      +------------------------------------------+
+                            |
+                 +----------+------------------------+-----------------------------------+
+                 |                                   |                                   |
+                 | goto                              | goto                              | goto
+                 | (svc-A)                           | (svc-B, svc-D)                    | (svc-C)
+                 v                                   v                                   v
++--------------------------------+  +--------------------------------+  +--------------------------------+
+| chain: dispatch-1              |  | chain: dispatch-2              |  | chain: dispatch-3              |
+|                                |  |                                |  |                                |
+| dnat to dst . proto . port     |  | dnat to dst . proto . port     |  | dnat to dst . proto . port     |
+|         . numgen random mod 1  |  |         . numgen random mod 2  |  |         . numgen random mod 3  |
+|         map @endpoints         |  |         map @endpoints         |  |         map @endpoints         |
++--------------------------------+  +--------------------------------+  +--------------------------------+
+                 |                                   |                                   |
+                 +-----------------------------+-----+-----------------------------------+
+                                               |
+                                               |  lookup  dst . proto . port . bucket
+                                               v
+      +--------------------------------------------------------------------------------+
+      |  map: @endpoints                                              (ONE shared map) |
+      |                                                                                |
+      |   typeof ip daddr . meta l4proto . th dport . meta length : ip daddr . th dport|
+      |                                                                                |
+      |   172.30.0.41 . tcp . 80 . 0 -> 10.0.1.1:80    # svc-A                         |
+      |                                                                                |
+      |   172.30.0.42 . tcp . 80 . 0 -> 10.0.2.1:80    # svc-B                         |
+      |   172.30.0.42 . tcp . 80 . 1 -> 10.0.2.2:80                                    |
+      |                                                                                |
+      |   172.30.0.43 . tcp . 80 . 0 -> 10.0.3.1:80    # svc-C                         |
+      |   172.30.0.43 . tcp . 80 . 1 -> 10.0.3.2:80                                    |
+      |   172.30.0.43 . tcp . 80 . 2 -> 10.0.3.3:80                                    |
+      |                                                                                |
+      |   172.30.0.44 . tcp . 80 . 0 -> 10.0.4.1:80    # svc-D                         |
+      |   172.30.0.44 . tcp . 80 . 1 -> 10.0.4.2:80                                    |
+      |   ...        one row per endpoint                                              |
+      +--------------------------------------------------------------------------------+
+                                               |
+                                               v
+                                         endpoint pod
+```
+
+`numgen` has no named datatype, so the map must be declared with `typeof`;
+`th dport` and `meta length` are only there to lend their datatypes
+(`inet_service`, 32-bit integer) to the key.
+
+#### Why it won't work
+
+nft rebuilds a `typeof` key from the set's userdata in every later `nft` run,
+and that path loses the raw flag on `th dport`. Adding a `dispatch-N` rule
+against a map that already exists in the kernel fails with:
+
+```
+Error: conflicting transport layer protocols specified: tcp vs. th
+```
+
+So it works on the very first sync and fails on every full sync and restart
+after that. Fixed in nftables commit
+[`1afa761d`](https://git.netfilter.org/nftables/commit/?id=1afa761d59834c61a30bdf7ffb52a0afaa7d40f4)
+(merged 2026-09-21), but that isn't in any release yet and kube-proxy's floor
+is nft 1.0.1.
+
+Potential workaround: rewrite the entire map on every update
+
+### Design 2: bucket via `ct mark`
+
+Same as Design 1, but `numgen` is written into `ct mark` first. `ct mark` has a
+named datatype (`mark`), so the map can use a plain `type` declaration and
+nothing goes through `typeof`.
 
 ```
     packet to  <clusterIP>:<port>
@@ -281,10 +384,14 @@ Example with four Services:
                                          endpoint pod
 ```
 
-The `dispatch-N` chains are not per Service: svc-B and svc-D both have two
-endpoints, so both `goto dispatch-2` and are told apart only by their rows in
-`@endpoints`. Only as many chains exist as there are distinct endpoint counts
-in the cluster.
+#### Why it won't work
+
+`ct mark set` overwrites the whole 32-bit conntrack mark, which kube-proxy
+doesn't own: CNIs and CONNMARK save/restore setups use it too. It can't be
+masked either, since merging `numgen` into part of the mark needs a
+two-register bitwise OR (kernel 6.13+ / nft 1.1.2+). `meta mark` has the same
+problem and additionally erases kube-proxy's own `0x4000` masquerade bit, which
+`services` sets before dispatching.
 
 ### Tradeoffs
 
