@@ -12,6 +12,8 @@
     - [Why it won't work](#why-it-wont-work-1)
   - [Design 3: one endpoints map per protocol](#design-3-one-endpoints-map-per-protocol)
     - [Downsides](#downsides)
+  - [Design 4: shared maps in kube-proxy](#design-4-shared-maps-in-kube-proxy)
+    - [Benchmark](#benchmark)
   - [Tradeoffs](#tradeoffs)
     - [Potential optimisations](#potential-optimisations)
 - [Alternative solutions](#alternative-solutions)
@@ -209,12 +211,12 @@ each still gets its own chain and map.
 
 ## Proposed designs: shared dispatch chains + shared endpoints maps
 
-Instead of a chain and an anonymous map per Service, all designs keep a
-fixed set of `dispatch-N` chains (one per *endpoint count*, shared by every
-Service with that many endpoints) and a shared `@endpoints` map that is
-keyed by the Service plus a random bucket number. Designs 1 and 2 differ only
-in how the bucket number gets into the map key; Design 3 splits the map per
-protocol.
+Instead of a chain and an anonymous map per Service, these designs use
+`dispatch-N` chains (one per *endpoint count*, shared by Services with that
+many endpoints) and shared endpoint maps keyed by the destination and a random
+bucket number. Designs 1 and 2 differ in how the bucket number gets into the
+map key; Design 3 splits the map per protocol. Design 4 implements that approach
+in kube-proxy and adds a separate family of maps for NodePorts.
 
 All examples use the same four Services:
 
@@ -506,6 +508,60 @@ round-trip, so dispatch rules can be added against existing maps. The costs:
   (kube-proxy's floor is 1.0.1).
 - Three element stores to keep in sync in kube-proxy instead of one.
 
+### Design 4: shared maps in kube-proxy
+
+The `nftables-shared-dispatch-maps` branch extends Design 3 to NodePorts.
+For a non-affinity TCP Service with two endpoints:
+
+```text
+ ClusterIP:80           ExternalIP/LB IP:80          node address:3003
+      |                         |                            |
+      v                         v                            v
+ @service-ips             @service-ips              @service-nodeports
+      |                         |                            |
+      |                   external-* chain            nodeport-* chain
+      |                   (traffic policy)            (traffic policy)
+      |                         |                            |
+      +------------+------------+                            |
+                   v                                         v
+              dispatch-2                              nodeport-dispatch-2
+                   |                                         |
+          dst IP . 80 . bucket                       3003 . bucket
+                   |                                         |
+                   v                                         v
+          @endpoints-tcp                          @nodeport-endpoints-tcp
+       ClusterIP . 80 . 0 -> endpoint A              3003 . 0 -> endpoint A
+       ClusterIP . 80 . 1 -> endpoint B              3003 . 1 -> endpoint B
+       ExternalIP . 80 . 0 -> endpoint A
+       ExternalIP . 80 . 1 -> endpoint B
+                   |                                         |
+                   +------------------+----------------------+
+                                      v
+                               selected endpoint
+```
+
+Each dispatch chain chooses a random bucket. NodePort maps omit the destination
+IP, so they work across node addresses. Both map families are split by
+protocol and IP family. Traffic policies can select different endpoint sets
+and dispatch chains for internal and external traffic.
+
+ClientIP affinity and `externalTrafficPolicy: Local` shortcuts still use
+per-Service chains. Endpoint slots stay contiguous, moving surviving endpoints
+only when necessary.
+
+The branch requires nft 1.0.3+; older host nft binaries can abort when listing
+these maps.
+
+#### Benchmark
+
+The branch commit reports `nft -f` timings for about 40,000 Services with one
+to five endpoints each (ruleset programming, not packet processing):
+
+| Ruleset | Real | User | System |
+| --- | ---: | ---: | ---: |
+| Before | 3m52.068s | 0m0.853s | 3m49.841s |
+| Shared maps | 0m0.716s | 0m0.487s | 0m0.197s |
+
 ### Tradeoffs
 
 Naturally, a change like this doesn't come for free.
@@ -520,7 +576,10 @@ In the past each Service would update it's anonymous map in a single command, ie
 add rule ip kube-proxy service-4AT6LBPK-ns3/svc3/tcp/p80 meta l4proto tcp dnat ip addr . port to numgen random mod 2 map { 0 : 10.0.3.2 . 80 , 1 : 10.0.3.3 . 80 }
 ```
 
-Changes to endpoints now require managing endpoints in that map, adding/removing them as nessesary. Additionally, `numgen random mod N` requires that the endpoint IPs value `ct mark` is sequential.
+Changes to endpoints now require managing elements in the shared map,
+adding/removing them as necessary. `numgen random mod N` requires the bucket
+numbers to be sequential. The examples below use Design 2's `ct mark` form;
+Design 4 uses the per-protocol maps described above instead.
 
 Example of adding the 40th endpoint to a 39 endpoint service:
 
